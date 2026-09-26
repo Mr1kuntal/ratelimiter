@@ -3,6 +3,7 @@ package ratelimiter
 import (
 	"context"
 	_ "embed"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -35,7 +36,11 @@ func WithKeyPrefix(prefix string) RedisOption {
 // rdb can be a *redis.Client (single instance) or a *redis.ClusterClient
 // (Redis Cluster) — both satisfy redis.Cmdable, and the Lua script runs
 // unchanged either way since Cluster routes each key to its shard.
-func NewRedisLimiter(rdb redis.Cmdable, cfg Config, opts ...RedisOption) *RedisLimiter {
+func NewRedisLimiter(rdb redis.Cmdable, cfg Config, opts ...RedisOption) (*RedisLimiter, error) {
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+
 	r := &RedisLimiter{
 		rdb:    rdb,
 		cfg:    cfg,
@@ -45,30 +50,41 @@ func NewRedisLimiter(rdb redis.Cmdable, cfg Config, opts ...RedisOption) *RedisL
 	for _, opt := range opts {
 		opt(r)
 	}
-	return r
+	return r, nil
 }
 
 // Allow implements Limiter. It calls the token bucket Lua script, so the
 // check-and-decrement is atomic even under concurrent calls from other
-// instances hitting the same key.
+// instances hitting the same key. The current time is read inside the
+// script from Redis itself, so clock drift between app servers can't skew
+// refill rates.
 func (r *RedisLimiter) Allow(ctx context.Context, key string) (Result, error) {
-	now := float64(time.Now().UnixNano()) / 1e9
+	if key == "" {
+		return Result{}, ErrEmptyKey
+	}
 
 	res, err := r.script.Run(ctx, r.rdb, []string{r.prefix + key},
-		r.cfg.Capacity, r.cfg.RefillPerSecond, now, 1,
+		r.cfg.Capacity, r.cfg.RefillPerSecond, 1,
 	).Result()
 	if err != nil {
 		return Result{}, err
 	}
 
-	vals := res.([]interface{})
-	allowed := vals[0].(int64) == 1
-	remaining := vals[1].(int64)
-	resetAfterMs := vals[2].(int64)
+	vals, ok := res.([]interface{})
+	if !ok || len(vals) != 3 {
+		return Result{}, fmt.Errorf("ratelimiter: unexpected script result shape: %#v", res)
+	}
+
+	allowedVal, ok1 := vals[0].(int64)
+	remaining, ok2 := vals[1].(int64)
+	resetAfterMs, ok3 := vals[2].(int64)
+	if !ok1 || !ok2 || !ok3 {
+		return Result{}, fmt.Errorf("ratelimiter: unexpected script result types: %#v", vals)
+	}
 
 	return Result{
-		Allowed:   allowed,
-		Remaining: remaining,
-		ResetAt:   time.Now().Add(time.Duration(resetAfterMs) * time.Millisecond),
+		Allowed:    allowedVal == 1,
+		Remaining:  remaining,
+		RetryAfter: time.Duration(resetAfterMs) * time.Millisecond,
 	}, nil
 }

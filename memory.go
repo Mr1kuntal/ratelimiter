@@ -24,12 +24,19 @@ type MemoryLimiter struct {
 }
 
 // NewMemoryLimiter creates an in-process limiter with the given config.
-func NewMemoryLimiter(cfg Config) *MemoryLimiter {
-	return &MemoryLimiter{cfg: cfg}
+func NewMemoryLimiter(cfg Config) (*MemoryLimiter, error) {
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	return &MemoryLimiter{cfg: cfg}, nil
 }
 
 // Allow implements Limiter.
 func (m *MemoryLimiter) Allow(_ context.Context, key string) (Result, error) {
+	if key == "" {
+		return Result{}, ErrEmptyKey
+	}
+
 	v, _ := m.buckets.LoadOrStore(key, &bucketState{
 		tokens:     float64(m.cfg.Capacity),
 		lastRefill: time.Now(),
@@ -49,16 +56,16 @@ func (m *MemoryLimiter) Allow(_ context.Context, key string) (Result, error) {
 		b.tokens--
 	}
 
-	var resetAt time.Time
+	var retryAfter time.Duration
 	if !allowed {
 		secsToOneToken := (1 - b.tokens) / m.cfg.RefillPerSecond
-		resetAt = now.Add(time.Duration(secsToOneToken * float64(time.Second)))
+		retryAfter = time.Duration(secsToOneToken * float64(time.Second))
 	}
 
 	return Result{
-		Allowed:   allowed,
-		Remaining: int64(b.tokens),
-		ResetAt:   resetAt,
+		Allowed:    allowed,
+		Remaining:  int64(b.tokens),
+		RetryAfter: retryAfter,
 	}, nil
 }
 

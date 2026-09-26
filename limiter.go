@@ -11,8 +11,16 @@ package ratelimiter
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 )
+
+// ErrEmptyKey is returned by Allow when called with an empty key. Silently
+// allowing this would mean every caller that forgets to supply a key (e.g.
+// an unauthenticated request reaching a user-ID KeyFunc) shares a single
+// global bucket — a subtle and dangerous bug in a reusable package.
+var ErrEmptyKey = errors.New("ratelimiter: key must not be empty")
 
 // Result describes the outcome of a single rate limit check.
 type Result struct {
@@ -20,9 +28,15 @@ type Result struct {
 	Allowed bool
 	// Remaining is the number of tokens left in the bucket after this check.
 	Remaining int64
-	// ResetAt is when the bucket is expected to have at least one token
-	// available again (only meaningful when Allowed is false).
-	ResetAt time.Time
+	// RetryAfter is how long to wait before at least one token is expected
+	// to be available again (zero when Allowed is true). It's a duration,
+	// not a timestamp: a token bucket refills continuously rather than
+	// "resetting" at a fixed point, and a duration computed server-side
+	// avoids depending on the caller's wall clock — deriving an absolute
+	// time is a one-line time.Now().Add(result.RetryAfter) for callers
+	// that want it, but that conversion is on them, not baked into the
+	// package's own correctness.
+	RetryAfter time.Duration
 }
 
 // Limiter checks whether a request identified by key should be permitted.
@@ -38,4 +52,14 @@ type Config struct {
 	Capacity int64
 	// RefillPerSecond is the steady-state number of tokens added per second.
 	RefillPerSecond float64
+}
+
+func (c Config) validate() error {
+	if c.Capacity <= 0 {
+		return fmt.Errorf("ratelimiter: Capacity must be > 0, got %d", c.Capacity)
+	}
+	if c.RefillPerSecond <= 0 {
+		return fmt.Errorf("ratelimiter: RefillPerSecond must be > 0, got %v", c.RefillPerSecond)
+	}
+	return nil
 }
